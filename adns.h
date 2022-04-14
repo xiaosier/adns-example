@@ -5,16 +5,16 @@
 /*
  *
  *  This file is
- *    Copyright (C) 1997-2000,2003,2006 Ian Jackson
+ *    Copyright (C) 1997-2000,2003,2006,2014 Ian Jackson
  *
  *  It is part of adns, which is
- *    Copyright (C) 1997-2000,2003,2006 Ian Jackson
+ *    Copyright (C) 1997-2000,2003,2006,2014 Ian Jackson
  *    Copyright (C) 1999-2000,2003,2006 Tony Finch
  *    Copyright (C) 1991 Massachusetts Institute of Technology
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
+ *  the Free Software Foundation; either version 3, or (at your option)
  *  any later version.
  *  
  *  This program is distributed in the hope that it will be useful,
@@ -48,11 +48,8 @@
  *
  *  You should have received a copy of the GNU General Public License,
  *  or the GNU Library General Public License, as appropriate, along
- *  with this program; if not, write to the Free Software Foundation,
- *  Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+ *  with this program; if not, write to the Free Software Foundation.
  *
- *
- *  $Id: adns.h,v 1.96 2006/08/09 11:16:59 ian Exp $
  */
 
 #ifndef ADNS_H_INCLUDED
@@ -66,13 +63,29 @@
 #include <netinet/in.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <net/if.h>
 
 #ifdef __cplusplus
 extern "C" { /* I really dislike this - iwj. */
 #endif
 
-#ifndef AF_INET6
-#include "adns-in6fake.h"
+/* Whether to support address families other than IPv4 in responses which use
+ * the `adns_rr_addr' structure.  This is a source-compatibility issue: old
+ * clients may not expect to find address families other than AF_INET in
+ * their query results.  There's a separate binary compatibility issue to do
+ * with the size of the `adns_rr_addr' structure, but we'll assume you can
+ * cope with that because you have this header file.  Define
+ * `ADNS_FEATURE_IPV4ONLY' if you only want to see AF_INET addresses by
+ * default, or `ADNS_FEATURE_MANYAF' to allow multiple address families; the
+ * default is currently to stick with AF_INET only, but this is likely to
+ * change in a later release of ADNS.  Note that any adns_qf_want_... flags
+ * in your query are observed: this setting affects only the default address
+ * families.
+ */
+#if !defined(ADNS_FEATURE_IPV4ONLY) && !defined(ADNS_FEATURE_MANYAF)
+#  define ADNS_FEATURE_IPV4ONLY
+#elif defined(ADNS_FEATURE_IPV4ONLY) && defined(ADNS_FEATURE_MANYAF)
+#  error "Feature flags ADNS_FEATURE_IPV4ONLY and ..._MANYAF are incompatible"
 #endif
 
 /* All struct in_addr anywhere in adns are in NETWORK byte order. */
@@ -92,9 +105,17 @@ typedef enum { /* In general, or together the desired flags: */
  adns_if_nosigpipe=   0x0040,/* applic has SIGPIPE ignored, do not protect */
  adns_if_checkc_entex=0x0100,/* consistency checks on entry/exit to adns fns */
  adns_if_checkc_freq= 0x0300,/* consistency checks very frequently (slow!) */
- adns_if_ip4only=     0x1000,/* make default be adns_qf_ip4 */
- adns_if_ip6only=     0x2000,/* make default be adns_qf_ip6 */
- adns_if_ip6mapped=   0x4000,/* make default be adns_qf_ip4|adns_qf_ip6|adns_qf_ip6mapped */
+
+ adns_if_permit_ipv4= 0x0400,/* allow _addr queries to return IPv4 addresses  */
+ adns_if_permit_ipv6= 0x0800,/* allow _addr queries to return IPv6 addresses */
+ adns_if_afmask=      0x0c00,
+   /* These are policy flags, and overridden by the adns_af:... option in
+    * resolv.conf.  If the adns_qf_want_... query flags are incompatible with
+    * these settings (in the sense that no address families are permitted at
+    * all) then the query flags take precedence; otherwise only records which
+    * satisfy all of the stated requirements are allowed.
+    */
+ adns__if_sizeforce= 0x7fff,
 } adns_initflags;
 
 typedef enum { /* In general, or together the desired flags: */
@@ -107,59 +128,41 @@ typedef enum { /* In general, or together the desired flags: */
  adns_qf_quoteok_anshost=0x00000040,/*  ... in things supposedly hostnames */
  adns_qf_quotefail_cname=0x00000080,/* refuse if quote-req chars in CNAME we go via */
  adns_qf_cname_loose=    0x00000100,/* allow refs to CNAMEs - without, get _s_cname */
+ adns_qf_cname_strict=   0x00010000,/* forbid CNAME refs (default, currently) */
  adns_qf_cname_forbid=   0x00000200,/* don't follow CNAMEs, instead give _s_cname */
 
- /* Affects addr queries and additional section processing */
- adns_qf_ip4=            0x00001000, /* Ask for A records */
- adns_qf_ip6=            0x00002000, /* Ask for AAAA records */
- adns_qf_ip6mapped=      0x00004000, /* Return any IPv4 addresses as IPv6 mapped addresses */
+ adns_qf_want_ipv4=	 0x00000400,/* try to return IPv4 addresses */
+ adns_qf_want_ipv6=	 0x00000800,/* try to return IPv6 addresses */
+ adns_qf_want_allaf=	 0x00000c00,/* all the above flag bits */
+   /* Without any of the _qf_want_... flags, _qtf_deref queries try to return
+    * all address families permitted by _if_permit_... (as overridden by the
+    * `adns_af:...'  configuration option).  Set flags to restrict the
+    * returned address families to the ones selected.
+    */
+ adns_qf_ipv6_mapv4=	 0x00001000,/*  ... return IPv4 addresses as v6-mapped */
 
- adns__qf_ip_mask=       0x00003000,
- adns__qf_internalmask=  0x0ff00000
+ adns_qf_addrlit_scope_forbid=0x00002000,/* forbid %<scope> in IPv6 literals */
+ adns_qf_addrlit_scope_numeric=0x00004000,/* %<scope> may only be numeric */
+ adns_qf_addrlit_ipv4_quadonly=0x00008000,/* reject non-dotted-quad ipv4 */
+
+ adns__qf_internalmask=  0x0ff00000,
+ adns__qf_sizeforce=     0x7fffffff
 } adns_queryflags;
 
-/* IPv6 support:
- *
- * The _qf_ip4 and _qf_ip6 says which kinds of address records (A and
- * AAAA) we should ask for. _qf_ip6mapped says how we return ipv6
- * addresses to the caller. Four modes of operation, corresponding to
- * the _if_ip* flags:
- *
- *     Record type:         A              AAAA
- *  flags:
- *
- *    Default               => AF_INET     => AF_INET6
- *				        
- *    _if_ip4only           => AF_INET     not used
- *				        
- *    _if_ip6only           not used       => AF_INET6
- *				        
- *    _if_ipv6mapped        => AF_INET6    => AF_INET6
- *				        
- *    _if_ip4only           => AF_INET6    not used
- *      | _if_ipv6mapped
- *
- * Furthermore, there are configuration options which can prevent the
- * use of either AAAA or A records for _r_addr; so it is safe to use
- * _qf_ip6_mapped and _r_addr without checking explicitly whether the host
- * has IPv6 connectivity.
- *
- * The corresponding _qf_ip* flags are constructed from the _if_ip*
- * flags and the query flags submitted to functions like adns_submit.
- * If none of _qf_ip4 and _qf_ip6 are set explicitly in the query
- * flags, the default behaviour is used. If the flags are set, the
- * default configuration is overridden.
- *
- * Applications which do not support IPv4 should set none of these
- * flags.  Applications which have been `naively' converted to use
- * AF_INET6 throughout should set adns_if_ip6.  Applications which
- * know what they are doing should know which flags to set :-).
- */
-  
 typedef enum {
  adns_rrt_typemask=  0x0ffff,
- adns__qtf_deref=    0x10000,/* dereference domains; perhaps get extra data */
+ adns_rrt_reprmask= 0xffffff,
+ adns__qtf_deref_bit=0x10000,/* internal version of ..._deref below */
  adns__qtf_mail822=  0x20000,/* return mailboxes in RFC822 rcpt field fmt   */
+
+ adns__qtf_bigaddr=0x1000000,/* use the new larger sockaddr union */
+ adns__qtf_manyaf= 0x2000000,/* permitted to return multiple address families */
+
+ adns__qtf_deref=    adns__qtf_deref_bit|adns__qtf_bigaddr
+#ifdef ADNS_FEATURE_MANYAF
+		     |adns__qtf_manyaf
+#endif
+			    ,/* dereference domains; perhaps get extra data */
 
  adns_r_unknown=     0x40000,
    /* To use this, ask for records of type   <rr-type-code>|adns_r_unknown.
@@ -179,8 +182,6 @@ typedef enum {
     *
     * Don't forget adns_qf_quoteok if that's what you want. */
 
- adns__qtf_special= 0x80000,/* no simple correspondence to a single rr type */
-
  adns_r_none=             0,
  		     
  adns_r_a=                1,
@@ -193,7 +194,7 @@ typedef enum {
  adns_r_soa_raw=          6,
  adns_r_soa=                 adns_r_soa_raw|adns__qtf_mail822, 
  		     
- adns_r_ptr_raw=         12, /* do not mind PTR with wrong or missing A */
+ adns_r_ptr_raw=         12, /* do not mind PTR with wrong or missing addr */
  adns_r_ptr=                 adns_r_ptr_raw|adns__qtf_deref,
  		     
  adns_r_hinfo=           13,  
@@ -205,7 +206,8 @@ typedef enum {
  		     
  adns_r_rp_raw=          17,
  adns_r_rp=                  adns_r_rp_raw|adns__qtf_mail822,
- adns_r_aaaa=            28,   /* RFC 1886 */
+
+ adns_r_aaaa=		 28,
 
  /* For SRV records, query domain without _qf_quoteok_query must look
   * as expected from SRV RFC with hostname-like Name.  _With_
@@ -213,8 +215,9 @@ typedef enum {
  adns_r_srv_raw=         33,
  adns_r_srv=                 adns_r_srv_raw|adns__qtf_deref,
 		     
- /* FIXME: Maybe add adns__qtf_deref too? */
- adns_r_addr=                1 | adns__qtf_special,
+ adns_r_addr=                adns_r_a|adns__qtf_deref,
+
+ adns__rrt_sizeforce= 0x7fffffff,
  
 } adns_rrtype;
 
@@ -315,8 +318,8 @@ typedef enum {
  adns_s_max_tempfail= 99,
 
  /* remote configuration errors */
- adns_s_inconsistent, /* PTR gives domain whose A does not exist and match */
- adns_s_prohibitedcname, /* CNAME, but eg A expected (not if _qf_loosecname) */
+ adns_s_inconsistent, /* PTR gives domain whose addr is missing or mismatch */
+ adns_s_prohibitedcname, /* CNAME, but eg A expected (not if _qf_cname_loose) */
  adns_s_answerdomaininvalid,
  adns_s_answerdomaintoolong,
  adns_s_invaliddata,
@@ -338,17 +341,28 @@ typedef enum {
  
 } adns_status;
 
+typedef union {
+  struct sockaddr sa;
+  struct sockaddr_in inet;
+} adns_sockaddr_v4only;
+
+typedef union {
+  struct sockaddr sa;
+  struct sockaddr_in inet;
+  struct sockaddr_in6 inet6;
+} adns_sockaddr;
+
 typedef struct {
   int len;
-#if 0
-  int order; /* Cache index on sortlist? */
-#endif
-  union {
-    struct sockaddr sa;
-    struct sockaddr_in inet;
-    struct sockaddr_in6 inet6;
-  } addr;
+  adns_sockaddr addr;
 } adns_rr_addr;
+
+typedef struct {
+  /* the old v4-only structure; handy if you have complicated binary
+   * compatibility problems. */
+  int len;
+  adns_sockaddr_v4only addr;
+} adns_rr_addr_v4only;
 
 typedef struct {
   char *host;
@@ -415,7 +429,7 @@ typedef struct {
     adns_rr_intstr *(*manyistr);     /* txt (list strs ends with i=-1, str=0)*/
     adns_rr_addr *addr;              /* addr */
     struct in_addr *inaddr;          /* a */
-    struct in6_addr *in6addr;        /* aaaa */
+    struct in6_addr *in6addr;	     /* aaaa */
     adns_rr_hostaddr *hostaddr;      /* ns */
     adns_rr_intstrpair *intstrpair;  /* hinfo */
     adns_rr_strpair *strpair;        /* rp, rp_raw */
@@ -566,13 +580,21 @@ int adns_init_logfn(adns_state *newstate_r, adns_initflags flags,
  *   Changes the consistency checking frequency; this overrides the
  *   setting of adns_if_check_entex, adns_if_check_freq, or neither,
  *   in the flags passed to adns_init.
- * 
- *  in6only
- *  in4only
- *   Return only IPv6, respectively only IPv4 addresses, in
- *   _rr_addr's.  This may result in an adns_s_nodata error, if the
- *   application only supports, or the remote host only has, the wrong
- *   kind of address.
+ *
+ *  adns_af:{ipv4,ipv6},...  adns_af:any
+ *   Determines which address families ADNS looks up (either as an
+ *   adns_r_addr query, or when dereferencing an answer yielding hostnames
+ *   (e.g., adns_r_mx).  The argument is a comma-separated list: only the
+ *   address families listed will be looked up.  The default is `any'.
+ *   Lookups occur (logically) concurrently; use the `sortlist' directive to
+ *   control the relative order of addresses in answers.  This option
+ *   overrides the corresponding init flags (covered by adns_if_afmask).
+ *
+ *  adns_ignoreunkcfg
+ *   Ignore unknown options and configuration directives, rather than
+ *   logging them.  To be effective, appear in the configuration
+ *   before the unknown options.  ADNS_RES_OPTIONS is generally early
+ *   enough.
  * 
  * There are a number of environment variables which can modify the
  * behaviour of adns.  They take effect only if adns_init is used, and
@@ -657,33 +679,7 @@ int adns_submit_reverse(adns_state ads,
 			void *context,
 			adns_query *query_r);
 /* type must be _r_ptr or _r_ptr_raw.  _qf_search is ignored.
- * addr->sa_family must be AF_INET or AF_INET6 or you get ENOSYS.
- */
-
-int adns_getaddrinfo(adns_state ads,
-		     const char *name,           /* Eg, "www.example.coom" */
-		     const char *service,        /* Eg, "http" */
-		     const char *protocol,       /* Eg, "tcp" */
-		     unsigned short defaultport, /* Eg, 80 */
-		     adns_queryflags flags,
-		     adns_answer **answer_r, int *invented_r);
-/* Does an SRV lookup (RFC2052).  If this fails, tries an AAAA or A
- * lookup instead, and if found uses getservbyname to find the port
- * number (or failing that, uses defaultport. The defaultport is in
- * hot byte order).  In the `fallback' case, will invent an SRV record
- * which have priority and weight == 0 and set *invented_r to 1; if
- * real SRV records were found, will set *invented_r to 0.  invented_r
- * may be null but answer_r may not be.  If _getaddrinfo returns
- * nonzero, *answer_r and/or *invented_r may or may not have been
- * overwritten and should not be used.
- *
- * NB, like adns_synchronous, can fail either by returning an errno
- * value, or by returning an adns_answer with ->nrrs==0 and
- * ->status!=0.
- *
- * You have to write two loops when using the returned value, an outer
- * one to loop over the returned SRV's, and an inner one to loop over
- * the addresses for each one.
+ * addr->sa_family must be AF_INET or you get ENOSYS.
  */
 
 int adns_submit_reverse_any(adns_state ads,
@@ -696,7 +692,7 @@ int adns_submit_reverse_any(adns_state ads,
 /* For RBL-style reverse `zone's; look up
  *   <reversed-address>.<zone>
  * Any type is allowed.  _qf_search is ignored.
- * addr->sa_family must be AF_INET or AF_INET6 or you get ENOSYS.
+ * addr->sa_family must be AF_INET or you get ENOSYS.
  */
 
 void adns_finish(adns_state ads);
@@ -704,6 +700,61 @@ void adns_finish(adns_state ads);
  * they will be cancelled.
  */
 
+#define ADNS_ADDR2TEXT_BUFLEN					\
+  (INET6_ADDRSTRLEN + 1/*%*/					\
+  + ((IF_NAMESIZE-1) > 9 ? (IF_NAMESIZE-1) : 9/*uint32*/)	\
+  + 1/* nul; included in IF_NAMESIZE */)
+
+int adns_text2addr(const char *text, uint16_t port, adns_queryflags flags,
+		   struct sockaddr *sa_r,
+		   socklen_t *salen_io /* updated iff OK or ENOSPC */);
+int adns_addr2text(const struct sockaddr *sa, adns_queryflags flags,
+		   char *buffer, int *buflen_io /* updated ONLY on ENOSPC */,
+		   int *port_r /* may be 0 */);
+  /*
+   * port is always in host byte order and is simply copied to and
+   * from the appropriate sockaddr field (byteswapped as necessary).
+   *
+   * The only flags supported are adns_qf_addrlit_...
+   *
+   * Error return values are:
+   *
+   *  ENOSPC    Output buffer is too small.  Can only happen if
+   *            *buflen_io < ADNS_ADDR2TEXT_BUFLEN or
+   *            *salen_io < sizeof(adns_sockaddr).  On return,
+   *            *buflen_io or *salen_io has been updated by adns.
+   *
+   *  EINVAL    text has invalid syntax.
+   *
+   *            text represents an address family not supported by
+   *            this version of adns.
+   *
+   *            Scoped address supplied (text contained "%" or
+   *            sin6_scope_id nonzero) but caller specified
+   *            adns_qf_addrlit_scope_forbid.
+   *
+   *            Scope name (rather than number) supplied in text but
+   *            caller specified adns_qf_addrlit_scope_numeric.
+   *
+   *  EAFNOSUPPORT   sa->sa_family is not supported (addr2text only).
+   *
+   *  ENOSYS    Unsupported flags set.
+   *
+   * Only if neither adns_qf_addrlit_scope_forbid nor
+   * adns_qf_addrlit_scope_numeric are set:
+   *
+   *  ENOSYS    Scope name supplied in text but IPv6 address part of
+   *            sockaddr is not a link local address.
+   *
+   *  ENXIO     Scope name supplied in text but if_nametoindex
+   *            said it wasn't a valid local interface name.
+   *
+   *  EIO       Scoped address supplied but if_nametoindex failed
+   *            in an unexpected way; adns has printed a message to
+   *            stderr.
+   *
+   *  any other   if_nametoindex failed in a more-or-less expected way.
+   */
 
 void adns_forallqueries_begin(adns_state ads);
 adns_query adns_forallqueries_next(adns_state ads, void **context_r);

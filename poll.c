@@ -4,14 +4,15 @@
  */
 /*
  *  This file is part of adns, which is
- *    Copyright (C) 1997-2000,2003,2006  Ian Jackson
+ *    Copyright (C) 1997-2000,2003,2006,2014  Ian Jackson
+ *    Copyright (C) 2014  Mark Wooding
  *    Copyright (C) 1999-2000,2003,2006  Tony Finch
  *    Copyright (C) 1991 Massachusetts Institute of Technology
  *  (See the file INSTALL for full details.)
  *  
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
+ *  the Free Software Foundation; either version 3, or (at your option)
  *  any later version.
  *  
  *  This program is distributed in the hope that it will be useful,
@@ -20,8 +21,7 @@
  *  GNU General Public License for more details.
  *  
  *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software Foundation,
- *  Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA. 
+ *  along with this program; if not, write to the Free Software Foundation.
  */
 
 #include <limits.h>
@@ -77,7 +77,7 @@ int adns_beforepoll(adns_state ads, struct pollfd *fds, int *nfds_io,
   }
   r= 0;
 xit:
-  adns__consistency(ads,0,cc_entex);
+  adns__returning(ads,0);
   return r;
 }
 
@@ -91,7 +91,7 @@ void adns_afterpoll(adns_state ads, const struct pollfd *fds, int nfds,
     adns__timeouts(ads, 1, 0,0, *now);
     adns__fdevents(ads, fds,nfds, 0,0,0,0, *now,0);
   }
-  adns__consistency(ads,0,cc_entex);
+  adns__returning(ads,0);
 }
 
 int adns_wait_poll(adns_state ads,
@@ -123,7 +123,7 @@ int adns_wait_poll(adns_state ads,
   }
 
  xit:
-  adns__consistency(ads,0,cc_entex);
+  adns__returning(ads,0);
   return r;
 }
 

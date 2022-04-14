@@ -5,15 +5,15 @@
  */
 /*
  *  This file is part of adns, which is
- *    Copyright (C) 2009 Luca Bruno
- *    Copyright (C) 1997-2000,2003,2006  Ian Jackson
+ *    Copyright (C) 1997-2000,2003,2006,2014  Ian Jackson
+ *    Copyright (C) 2014  Mark Wooding
  *    Copyright (C) 1999-2000,2003,2006  Tony Finch
  *    Copyright (C) 1991 Massachusetts Institute of Technology
  *  (See the file INSTALL for full details.)
  *  
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
+ *  the Free Software Foundation; either version 3, or (at your option)
  *  any later version.
  *  
  *  This program is distributed in the hope that it will be useful,
@@ -22,8 +22,7 @@
  *  GNU General Public License for more details.
  *  
  *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software Foundation,
- *  Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA. 
+ *  along with this program; if not, write to the Free Software Foundation.
  */
 
 #include <stdlib.h>
@@ -42,51 +41,31 @@
 
 static void readconfig(adns_state ads, const char *filename, int warnmissing);
 
-static void addserverv4(adns_state ads, struct in_addr addr) {
+static void addserver(adns_state ads, const struct sockaddr *sa, int salen) {
   int i;
-  struct server *ss;
+  adns_rr_addr *ss;
+  char buf[ADNS_ADDR2TEXT_BUFLEN];
   
   for (i=0; i<ads->nservers; i++) {
-    if ((ads->servers[i].sin_family == AF_INET) && (ads->servers[i].addr.s_addr == addr.s_addr)) {
-      adns__debug(ads,-1,0,"duplicate nameserver %s ignored",inet_ntoa(addr));
+    if (adns__sockaddrs_equal(sa, &ads->servers[i].addr.sa)) {
+      adns__debug(ads,-1,0,"duplicate nameserver %s ignored",
+		  adns__sockaddr_ntoa(sa, buf));
       return;
     }
   }
   
   if (ads->nservers>=MAXSERVERS) {
-    adns__diag(ads,-1,0,"too many nameservers, ignoring %s",inet_ntoa(addr));
+    adns__diag(ads,-1,0,"too many nameservers, ignoring %s",
+	       adns__sockaddr_ntoa(sa, buf));
     return;
   }
 
   ss= ads->servers+ads->nservers;
-  ss->sin_family= AF_INET;
-  ss->addr= addr;
+  assert(salen <= sizeof(ss->addr));
+  ss->len = salen;
+  memcpy(&ss->addr, sa, salen);
   ads->nservers++;
 }
-
-static void addserverv6(adns_state ads, struct in6_addr addr) {
-  int i;
-  struct server *ss;
-  char buf[INET6_ADDRSTRLEN];
-
-  for (i=0; i<ads->nservers; i++) {
-    if ((ads->servers[i].sin_family == AF_INET6) && !(memcmp(&(ads->servers[i].addr6.s6_addr), &(addr.s6_addr), sizeof(struct in6_addr)))) {
-      adns__debug(ads,-1,0,"duplicate nameserver %s ignored", inet_ntop(AF_INET6, &addr, buf, INET6_ADDRSTRLEN*sizeof(char)));
-      return;
-    }
-  }
-
-  if (ads->nservers>=MAXSERVERS) {
-    adns__diag(ads,-1,0,"too many nameservers, ignoring %s", inet_ntop(AF_INET6, &addr, buf, INET6_ADDRSTRLEN*sizeof(char)));
-    return;
-  }
-
-  ss= ads->servers+ads->nservers;
-  ss->sin_family= AF_INET6;
-  ss->addr6= addr;
-  ads->nservers++;
-}
-
 
 static void freesearchlist(adns_state ads) {
   if (ads->nsearchlist) free(*ads->searchlist);
@@ -131,27 +110,27 @@ static int nextword(const char **bufp_io, const char **word_r, int *l_r) {
 
 static void ccf_nameserver(adns_state ads, const char *fn,
 			   int lno, const char *buf) {
-  struct in_addr ia4;
-  struct in6_addr ia6;
-  char ns_name[INET6_ADDRSTRLEN];
+  adns_rr_addr a;
+  char addrbuf[ADNS_ADDR2TEXT_BUFLEN];
+  int err;
 
-  if (!inet_aton(buf,&ia4)) {
-    if (!inet_pton(AF_INET6, buf,&ia6)) {
-	configparseerr(ads,fn,lno,"invalid nameserver address `%s'",buf);
-	return;
-    }
-    else {
-	adns__debug(ads,-1,0,"using nameserver %s", inet_ntop(AF_INET6, &ia6, ns_name, INET6_ADDRSTRLEN*sizeof(char)));
-	addserverv6(ads,ia6);
-	
-    }
+  a.len= sizeof(a.addr);
+  err= adns_text2addr(buf,DNS_PORT, 0, &a.addr.sa,&a.len);
+  switch (err) {
+  case 0:
+    break;
+  case EINVAL:
+    configparseerr(ads,fn,lno,"invalid nameserver address `%s'",buf);
+    return;
+  default:
+    configparseerr(ads,fn,lno,"failed to parse nameserver address `%s': %s",
+		   buf,strerror(err));
+    return;
   }
-  else {
-    adns__debug(ads,-1,0,"using nameserver %s",inet_ntoa(ia4));
-    addserverv4(ads,ia4);
-  }
+  adns__debug(ads,-1,0,"using nameserver %s",
+	      adns__sockaddr_ntoa(&a.addr.sa, addrbuf));
+  addserver(ads,&a.addr.sa,a.len);
 }
-
 
 static void ccf_search(adns_state ads, const char *fn,
 		       int lno, const char *buf) {
@@ -186,14 +165,26 @@ static void ccf_search(adns_state ads, const char *fn,
   ads->searchlist= newptrs;
 }
 
+static int gen_pton(const char *text, int want_af, adns_sockaddr *a) {
+  int err;
+  int len;
+
+  len= sizeof(*a);
+  err= adns_text2addr(text,0, adns_qf_addrlit_scope_forbid,
+		      &a->sa, &len);
+  if (err) { assert(err == EINVAL); return 0; }
+  if (want_af != AF_UNSPEC && a->sa.sa_family != want_af) return 0;
+  return 1;
+}
+
 static void ccf_sortlist(adns_state ads, const char *fn,
 			 int lno, const char *buf) {
-  /* FIXME: Handle IPv6 addresses */
   const char *word;
   char tbuf[200], *slash, *ep;
-  struct in_addr base, mask;
+  const char *maskwhat;
+  struct sortlist *sl;
   int l;
-  unsigned long initial, baselocal;
+  int initial= -1;
 
   if (!buf) return;
   
@@ -213,65 +204,55 @@ static void ccf_sortlist(adns_state ads, const char *fn,
     memcpy(tbuf,word,l); tbuf[l]= 0;
     slash= strchr(tbuf,'/');
     if (slash) *slash++= 0;
-    
-    if (!inet_aton(tbuf,&base)) {
+
+    sl= &ads->sortlist[ads->nsortlist];
+    if (!gen_pton(tbuf, AF_UNSPEC, &sl->base)) {
       configparseerr(ads,fn,lno,"invalid address `%s' in sortlist",tbuf);
       continue;
     }
 
     if (slash) {
-      if (strchr(slash,'.')) {
-	if (!inet_aton(slash,&mask)) {
+      if (slash[strspn(slash, "0123456789")]) {
+	maskwhat = "mask";
+	if (!gen_pton(slash, sl->base.sa.sa_family, &sl->mask)) {
 	  configparseerr(ads,fn,lno,"invalid mask `%s' in sortlist",slash);
 	  continue;
 	}
-	if (base.s_addr & ~mask.s_addr) {
-	  configparseerr(ads,fn,lno, "mask `%s' in sortlist"
-			 " overlaps address `%s'",slash,tbuf);
-	  continue;
-	}
-	{
-	  /* Convert bitmask to prefix length */
-	  unsigned long bits;
-
-	  for(bits=ntohl(mask.s_addr), initial = 0;
-	      bits & 0x80000000UL;
-	      bits <<= 1)
-	    initial++;
-
-	  if (bits & 0xffffffff) {
-	    configparseerr(ads,fn,lno,
-			   "mask `%s' in sortlist is non-continuous",slash);
-	    continue;
-	  }
-	}
       } else {
+	maskwhat = "prefix length";
 	initial= strtoul(slash,&ep,10);
-	if (*ep || initial>32) {
+	if (*ep || initial>adns__addr_width(sl->base.sa.sa_family)) {
 	  configparseerr(ads,fn,lno,"mask length `%s' invalid",slash);
 	  continue;
 	}
-	mask.s_addr= htonl((0x0ffffffffUL) << (32-initial));
+	sl->mask.sa.sa_family= sl->base.sa.sa_family;
+	adns__prefix_mask(&sl->mask, initial);
       }
     } else {
-      baselocal= ntohl(base.s_addr);
-      if (!baselocal & 0x080000000UL) /* class A */
-	initial = 8;
-      else if ((baselocal & 0x0c0000000UL) == 0x080000000UL)
-	initial= 16;                  /* class B */
-      else if ((baselocal & 0x0f0000000UL) == 0x0e0000000UL)
-	initial= 24;                  /* class C */
-      else {
+      maskwhat = "implied prefix length";
+      initial= adns__guess_prefix_length(&sl->base);
+      if (initial < 0) {
 	configparseerr(ads,fn,lno, "network address `%s'"
 		       " in sortlist is not in classed ranges,"
 		       " must specify mask explicitly", tbuf);
 	continue;
       }
+      sl->mask.sa.sa_family= sl->base.sa.sa_family;
+      adns__prefix_mask(&sl->mask, initial);
     }
 
-    ads->sortlist[ads->nsortlist].family= AF_INET;
-    ads->sortlist[ads->nsortlist].base.inet= base;
-    ads->sortlist[ads->nsortlist].prefix= initial;
+    if (!adns__addr_matches(sl->base.sa.sa_family,
+			    adns__sockaddr_addr(&sl->base.sa),
+			    &sl->base,&sl->mask)) {
+      if (initial >= 0) {
+	configparseerr(ads,fn,lno, "%s %d in sortlist"
+		       " overlaps address `%s'",maskwhat,initial,tbuf);
+      } else {
+	configparseerr(ads,fn,lno, "%s `%s' in sortlist"
+		       " overlaps address `%s'",maskwhat,slash,tbuf);
+      }
+      continue;
+    }
 
     ads->nsortlist++;
   }
@@ -279,45 +260,95 @@ static void ccf_sortlist(adns_state ads, const char *fn,
 
 static void ccf_options(adns_state ads, const char *fn,
 			int lno, const char *buf) {
-  const char *word;
+  const char *opt, *word, *endword, *endopt;
   char *ep;
   unsigned long v;
   int l;
 
   if (!buf) return;
 
+#define WORD__IS(s,op) ((endword-word) op (sizeof(s)-1) && \
+			  !memcmp(word,s,(sizeof(s)-1)))
+#define WORD_IS(s)     (WORD__IS(s,==))
+#define WORD_STARTS(s) (WORD__IS(s,>=) ? ((word+=sizeof(s)-1)) : 0)
+
   while (nextword(&buf,&word,&l)) {
-    if (l==5 && !memcmp(word,"debug",5)) {
+    opt=word;
+    endopt=endword=word+l;
+    if (WORD_IS("debug")) {
       ads->iflags |= adns_if_debug;
       continue;
     }
-    if (l>=6 && !memcmp(word,"ndots:",6)) {
-      v= strtoul(word+6,&ep,10);
-      if (l==6 || ep != word+l || v > INT_MAX) {
+    if (WORD_STARTS("ndots:")) {
+      v= strtoul(word,&ep,10);
+      if (ep==word || ep != endword || v > INT_MAX) {
 	configparseerr(ads,fn,lno,"option `%.*s' malformed"
-		       " or has bad value",l,word);
+		       " or has bad value",l,opt);
 	continue;
       }
       ads->searchndots= v;
       continue;
     }
-    if (l>=12 && !memcmp(word,"adns_checkc:",12)) {
-      if (!strcmp(word+12,"none")) {
+    if (WORD_STARTS("adns_checkc:")) {
+      if (WORD_IS("none")) {
 	ads->iflags &= ~adns_if_checkc_freq;
 	ads->iflags |= adns_if_checkc_entex;
-      } else if (!strcmp(word+12,"entex")) {
+      } else if (WORD_IS("entex")) {
 	ads->iflags &= ~adns_if_checkc_freq;
 	ads->iflags |= adns_if_checkc_entex;
-      } else if (!strcmp(word+12,"freq")) {
+      } else if (WORD_IS("freq")) {
 	ads->iflags |= adns_if_checkc_freq;
       } else {
 	configparseerr(ads,fn,lno, "option adns_checkc has bad value `%s' "
-		       "(must be none, entex or freq", word+12);
+		       "(must be none, entex or freq", word);
       }
       continue;
     }
-    adns__diag(ads,-1,0,"%s:%d: unknown option `%.*s'", fn,lno, l,word);
+    if (WORD_STARTS("adns_af:")) {
+      ads->iflags &= ~adns_if_afmask;
+      if (!WORD_IS("any")) for (;;) {
+	const char *comma= memchr(word,',',endopt-word);
+	endword=comma?comma:endopt;
+	if (WORD_IS("ipv4"))
+	  ads->iflags |= adns_if_permit_ipv4;
+	else if (WORD_IS("ipv6"))
+	  ads->iflags |= adns_if_permit_ipv6;
+	else {
+	  if (ads->config_report_unknown)
+	    adns__diag(ads,-1,0,"%s:%d: "
+		       "option adns_af has bad value or entry `%.*s' "
+		       "(option must be `any', or list of `ipv4',`ipv6')",
+		       fn,lno, (int)(endword-word),word);
+	  break;
+	}
+	if (!comma) break;
+	word= comma+1;
+      }
+      continue;
+    }
+    if (WORD_IS("adns_ignoreunkcfg")) {
+      ads->config_report_unknown=0;
+      continue;
+    }
+    if (/* adns's query strategy is not configurable */
+	WORD_STARTS("timeout:") ||
+	WORD_STARTS("attempts:") ||
+	WORD_IS("rotate") ||
+	/* adns provides the application with knob for this */
+	WORD_IS("no-check-names") ||
+	/* adns normally does IPv6 if the application wants it; control
+	 * this with the adns_af: option if you like */
+	WORD_IS("inet6") ||
+	/* adns does not do edns0 and this is not a problem */
+	WORD_IS("edns0"))
+      continue;
+    if (ads->config_report_unknown)
+      adns__diag(ads,-1,0,"%s:%d: unknown option `%.*s'", fn,lno, l,opt);
   }
+
+#undef WORD__IS
+#undef WORD_IS
+#undef WORD_STARTS
 }
 
 static void ccf_clearnss(adns_state ads, const char *fn,
@@ -354,13 +385,18 @@ static void ccf_lookup(adns_state ads, const char *fn, int lno,
       adns__diag(ads,-1,0,"%s:%d: yp lookups not supported by adns", fn,lno);
       found_bind=-1;
     } else {
-      adns__diag(ads,-1,0,"%s:%d: unknown `lookup' database `%.*s'",
-		 fn,lno, l,word);
+      if (ads->config_report_unknown)
+	adns__diag(ads,-1,0,"%s:%d: unknown `lookup' database `%.*s'",
+		   fn,lno, l,word);
       found_bind=-1;
     }
   }
   if (!found_bind)
     adns__diag(ads,-1,0,"%s:%d: `lookup' specified, but not `bind'", fn,lno);
+}
+
+static void ccf_ignore(adns_state ads, const char *fn, int lno,
+		       const char *buf) {
 }
 
 static const struct configcommandinfo {
@@ -375,6 +411,7 @@ static const struct configcommandinfo {
   { "clearnameservers",  ccf_clearnss    },
   { "include",           ccf_include     },
   { "lookup",            ccf_lookup      }, /* OpenBSD */
+  { "lwserver",          ccf_ignore      }, /* BIND9 lwresd */
   {  0                                   }
 };
 
@@ -480,8 +517,9 @@ static void readconfiggeneric(adns_state ads, const char *filename,
 	   !(strlen(ccip->name)==dirl && !memcmp(ccip->name,p,q-p));
 	 ccip++);
     if (!ccip->name) {
-      adns__diag(ads,-1,0,"%s:%d: unknown configuration directive `%.*s'",
-		 filename,lno,(int)(q-p),p);
+      if (ads->config_report_unknown)
+	adns__diag(ads,-1,0,"%s:%d: unknown configuration directive `%.*s'",
+		   filename,lno,(int)(q-p),p);
       continue;
     }
     while (ctype_whitespace(*q)) q++;
@@ -566,6 +604,10 @@ static int init_begin(adns_state *ads_r, adns_initflags flags,
   adns_state ads;
   pid_t pid;
   
+  if (flags & ~(adns_initflags)(0x4fff))
+    /* 0x4000 is reserved for `harmless' future expansion */
+    return ENOSYS;
+
   ads= malloc(sizeof(*ads)); if (!ads) return errno;
 
   ads->iflags= flags;
@@ -576,9 +618,11 @@ static int init_begin(adns_state *ads_r, adns_initflags flags,
   LIST_INIT(ads->tcpw);
   LIST_INIT(ads->childw);
   LIST_INIT(ads->output);
+  LIST_INIT(ads->intdone);
   ads->forallnext= 0;
   ads->nextid= 0x311f;
-  ads->udpsocket= ads->udpsocket6= ads->tcpsocket= -1;
+  ads->nudpsockets= 0;
+  ads->tcpsocket= -1;
   adns__vbuf_init(&ads->tcpsend);
   adns__vbuf_init(&ads->tcprecv);
   ads->tcprecv_skip= 0;
@@ -587,6 +631,7 @@ static int init_begin(adns_state *ads_r, adns_initflags flags,
   ads->tcpstate= server_disconnected;
   timerclear(&ads->tcptimeout);
   ads->searchlist= 0;
+  ads->config_report_unknown=1;
 
   pid= getpid();
   ads->rand48xsubi[0]= pid;
@@ -598,41 +643,42 @@ static int init_begin(adns_state *ads_r, adns_initflags flags,
 }
 
 static int init_finish(adns_state ads) {
-  struct in_addr ia;
+  struct sockaddr_in sin;
   struct protoent *proto;
+  struct udpsocket *udp;
+  int i;
   int r;
   
   if (!ads->nservers) {
     if (ads->logfn && ads->iflags & adns_if_debug)
-      adns__lprintf(ads,"adns: no nameservers, using localhost\n");
-    ia.s_addr= htonl(INADDR_LOOPBACK);
-    addserverv4(ads,ia);
+      adns__lprintf(ads,"adns: no nameservers, using IPv4 localhost\n");
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(DNS_PORT);
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addserver(ads,(struct sockaddr *)&sin, sizeof(sin));
   }
 
   proto= getprotobyname("udp"); if (!proto) { r= ENOPROTOOPT; goto x_free; }
-  ads->udpsocket= socket(AF_INET,SOCK_DGRAM,proto->p_proto);
-  if (ads->udpsocket<0) { r= errno; goto x_free; }
-
-  ads->udpsocket6= socket(AF_INET6,SOCK_DGRAM,proto->p_proto);
-  if (ads->udpsocket6<0) { r= errno; goto x_free6; }
-
-  r= adns__setnonblock(ads,ads->udpsocket);
-  if (r) { r= errno; goto x_closeudp; }
-  
-  r= adns__setnonblock(ads,ads->udpsocket6);
-  if (r) { r= errno; goto x_closeudp6; }
+  ads->nudpsockets= 0;
+  for (i=0; i<ads->nservers; i++) {
+    if (adns__udpsocket_by_af(ads, ads->servers[i].addr.sa.sa_family))
+      continue;
+    assert(ads->nudpsockets < MAXUDP);
+    udp= &ads->udpsockets[ads->nudpsockets];
+    udp->af= ads->servers[i].addr.sa.sa_family;
+    udp->fd= socket(udp->af,SOCK_DGRAM,proto->p_proto);
+    if (udp->fd < 0) { r= errno; goto x_free; }
+    ads->nudpsockets++;
+    r= adns__setnonblock(ads,udp->fd);
+    if (r) { r= errno; goto x_closeudp; }
+  }
   
   return 0;
 
  x_closeudp:
-  close(ads->udpsocket);
+  for (i=0; i<ads->nudpsockets; i++) close(ads->udpsockets[i].fd);
  x_free:
-  free(ads);
-  return r;
- 
- x_closeudp6:
-  close(ads->udpsocket6);
- x_free6:
   free(ads);
   return r;
 }
@@ -738,18 +784,17 @@ int adns_init_logfn(adns_state *newstate_r, adns_initflags flags,
 }
 
 void adns_finish(adns_state ads) {
+  int i;
   adns__consistency(ads,0,cc_entex);
   for (;;) {
-    if (ads->udpw.head) adns_cancel(ads->udpw.head);
-    else if (ads->tcpw.head) adns_cancel(ads->tcpw.head);
-    else if (ads->childw.head) adns_cancel(ads->childw.head);
-    else if (ads->output.head) adns_cancel(ads->output.head);
+    if (ads->udpw.head) adns__cancel(ads->udpw.head);
+    else if (ads->tcpw.head) adns__cancel(ads->tcpw.head);
+    else if (ads->childw.head) adns__cancel(ads->childw.head);
+    else if (ads->output.head) adns__cancel(ads->output.head);
+    else if (ads->intdone.head) adns__cancel(ads->output.head);
     else break;
   }
-  if (ads->udpsocket >= 0)
-    close(ads->udpsocket);
-  if (ads->udpsocket6 >= 0)
-    close(ads->udpsocket6);
+  for (i=0; i<ads->nudpsockets; i++) close(ads->udpsockets[i].fd);
   if (ads->tcpsocket >= 0) close(ads->tcpsocket);
   adns__vbuf_free(&ads->tcpsend);
   adns__vbuf_free(&ads->tcprecv);

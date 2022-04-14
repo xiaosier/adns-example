@@ -5,14 +5,15 @@
  */
 /*
  *  This file is part of adns, which is
- *    Copyright (C) 1997-2000,2003,2006  Ian Jackson
+ *    Copyright (C) 1997-2000,2003,2006,2014  Ian Jackson
+ *    Copyright (C) 2014  Mark Wooding
  *    Copyright (C) 1999-2000,2003,2006  Tony Finch
  *    Copyright (C) 1991 Massachusetts Institute of Technology
  *  (See the file INSTALL for full details.)
  *  
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
+ *  the Free Software Foundation; either version 3, or (at your option)
  *  any later version.
  *  
  *  This program is distributed in the hope that it will be useful,
@@ -21,8 +22,7 @@
  *  GNU General Public License for more details.
  *  
  *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software Foundation,
- *  Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA. 
+ *  along with this program; if not, write to the Free Software Foundation.
  */
 
 #include <stdlib.h>
@@ -50,6 +50,7 @@ void adns__lprintf(adns_state ads, const char *fmt, ...) {
 
 void adns__vdiag(adns_state ads, const char *pfx, adns_initflags prevent,
 		 int serv, adns_query qu, const char *fmt, va_list al) {
+  char buf[ADNS_ADDR2TEXT_BUFLEN];
   const char *bef, *aft;
   vbuf vb;
   
@@ -83,7 +84,8 @@ void adns__vdiag(adns_state ads, const char *pfx, adns_initflags prevent,
   }
   
   if (serv>=0) {
-    adns__lprintf(ads,"%sNS=%s",bef,inet_ntoa(ads->servers[serv].addr));
+    adns__lprintf(ads,"%sNS=%s",bef,
+		  adns__sockaddr_ntoa(&ads->servers[serv].addr.sa, buf));
     bef=", "; aft=")\n";
   }
 
@@ -196,6 +198,9 @@ const char *adns__diag_domain(adns_state ads, int serv, adns_query qu,
   return vb->buf;
 }
 
+int adns__getrrsz_default(const typeinfo *typei, adns_rrtype type)
+  { return typei->fixed_rrsz; }
+
 adns_status adns_rr_info(adns_rrtype type,
 			 const char **rrtname_r, const char **fmtname_r,
 			 int *len_r,
@@ -209,7 +214,7 @@ adns_status adns_rr_info(adns_rrtype type,
 
   if (rrtname_r) *rrtname_r= typei->rrtname;
   if (fmtname_r) *fmtname_r= typei->fmtname;
-  if (len_r) *len_r= typei->rrsz;
+  if (len_r) *len_r= typei->getrrsz(typei, type);
 
   if (!datap) return adns_s_ok;
   

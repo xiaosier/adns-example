@@ -6,14 +6,15 @@
  */
 /*
  *  This file is part of adns, which is
- *    Copyright (C) 1997-2000,2003,2006  Ian Jackson
+ *    Copyright (C) 1997-2000,2003,2006,2014  Ian Jackson
+ *    Copyright (C) 2014  Mark Wooding
  *    Copyright (C) 1999-2000,2003,2006  Tony Finch
  *    Copyright (C) 1991 Massachusetts Institute of Technology
  *  (See the file INSTALL for full details.)
  *  
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
+ *  the Free Software Foundation; either version 3, or (at your option)
  *  any later version.
  *  
  *  This program is distributed in the hope that it will be useful,
@@ -22,8 +23,7 @@
  *  GNU General Public License for more details.
  *  
  *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software Foundation,
- *  Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA. 
+ *  along with this program; if not, write to the Free Software Foundation.
  */
 
 #include "internal.h"
@@ -35,10 +35,6 @@
 #include <sys/time.h>
 
 #include "internal.h"
-
-#if DMALLOC
-# include <dmalloc.h>
-#endif
 
 static adns_query query_alloc(adns_state ads,
 			      const typeinfo *typei, adns_rrtype type,
@@ -80,7 +76,6 @@ static adns_query query_alloc(adns_state ads,
   qu->expires= now.tv_sec + MAXTTLBELIEVE;
 
   memset(&qu->ctx,0,sizeof(qu->ctx));
-  memset(&qu->extra,0,sizeof(qu->extra));
 
   qu->answer->status= adns_s_ok;
   qu->answer->cname= qu->answer->owner= 0;
@@ -88,23 +83,9 @@ static adns_query query_alloc(adns_state ads,
   qu->answer->expires= -1;
   qu->answer->nrrs= 0;
   qu->answer->rrs.untyped= 0;
-  qu->answer->rrsz= typei->rrsz;
+  qu->answer->rrsz= typei->getrrsz(typei,type);
 
   return qu;
-}
-
-static adns_queryflags default_ip6_flags(adns_state ads)
-{
-  adns_queryflags flags = 0;
-
-  if (!(ads->iflags & adns_if_ip4only))
-    flags |= adns_qf_ip4;
-  if (!(ads->iflags & adns_if_ip6only))
-    flags |= adns_qf_ip6;
-  if (ads->iflags & adns_if_ip6mapped)
-    flags |= adns_qf_ip6mapped;
-
-  return flags;
 }
 
 static void query_submit(adns_state ads, adns_query qu,
@@ -123,40 +104,75 @@ static void query_submit(adns_state ads, adns_query qu,
   qu->id= id;
   qu->query_dglen= qu->vb.used;
   memcpy(qu->query_dgram,qu->vb.buf,qu->vb.used);
-  
-  adns__query_send(qu,now);
+
+  typei->query_send(qu,now);
 }
 
-/* FIXME: Take a adns_rrtype type artument? */
-adns_status adns__internal_submit(adns_state ads, adns_query *query_r,
-				  const typeinfo *typei, vbuf *qumsg_vb,
-				  int id,
-				  adns_queryflags flags, struct timeval now,
-				  const qcontext *ctx) {
-  adns_query qu;
+adns_status adns__ckl_hostname(adns_state ads, adns_queryflags flags,
+			       union checklabel_state *cls,
+			       qcontext *ctx, int labnum,
+			       const char *dgram, int labstart, int lablen)
+{
+  int i, c;
+  const char *label = dgram+labstart;
 
-  if (!(flags & adns__qf_ip_mask))
-    flags |= default_ip6_flags(ads);
-  
-  qu= query_alloc(ads,typei,typei->typekey,flags,now);
-  if (!qu) { adns__vbuf_free(qumsg_vb); return adns_s_nomemory; }
-  *query_r= qu;
-
-  memcpy(&qu->ctx,ctx,sizeof(qu->ctx));
-
-  if (typei->submithook) {
-    qu->vb = *qumsg_vb;
-    adns__vbuf_init(qumsg_vb);
-
-    typei->submithook(qu, flags, now); 
-    if (qu->children.head) {
-      qu->state= query_childw;
-      LIST_LINK_TAIL(ads->childw,qu);
+  if (flags & adns_qf_quoteok_query) return adns_s_ok;
+  for (i=0; i<lablen; i++) {
+    c= label[i];
+    if (c == '-') {
+      if (!i) return adns_s_querydomaininvalid;
+    } else if (!ctype_alpha(c) && !ctype_digit(c)) {
+      return adns_s_querydomaininvalid;
     }
   }
-  else query_submit(ads,qu, typei,qumsg_vb,id,flags,now);
+  return adns_s_ok;
+}
+
+static adns_status check_domain_name(adns_state ads, adns_queryflags flags,
+				     qcontext *ctx, const typeinfo *typei,
+				     const byte *dgram, int dglen)
+{
+  findlabel_state fls;
+  adns_status st;
+  int labnum= 0, labstart, lablen;
+  union checklabel_state cls;
+
+  adns__findlabel_start(&fls,ads, -1,0, dgram,dglen,dglen, DNS_HDRSIZE,0);
+  do {
+    st= adns__findlabel_next(&fls, &lablen,&labstart);
+    assert(!st); assert(lablen >= 0);
+    st= typei->checklabel(ads,flags, &cls,ctx,
+			   labnum++, dgram,labstart,lablen);
+    if (st) return st;
+  } while (lablen);
+  return adns_s_ok;
+}
+
+adns_status adns__internal_submit(adns_state ads, adns_query *query_r,
+				  adns_query parent,
+				  const typeinfo *typei, adns_rrtype type,
+				  vbuf *qumsg_vb, int id,
+				  adns_queryflags flags, struct timeval now,
+				  qcontext *ctx) {
+  adns_query qu;
+  adns_status st;
+
+  st= check_domain_name(ads, flags,ctx,typei, qumsg_vb->buf,qumsg_vb->used);
+  if (st) goto x_err;
+  qu= query_alloc(ads,typei,type,flags,now);
+  if (!qu) { st = adns_s_nomemory; goto x_err; }
+  *query_r= qu;
+
+  qu->parent= parent;
+  LIST_LINK_TAIL_PART(parent->children,qu,siblings.);
+  memcpy(&qu->ctx,ctx,sizeof(qu->ctx));
+  query_submit(ads,qu, typei,qumsg_vb,id,flags,now);
   
   return adns_s_ok;
+
+x_err:
+  adns__vbuf_free(qumsg_vb);
+  return st;
 }
 
 static void query_simple(adns_state ads, adns_query qu,
@@ -165,39 +181,31 @@ static void query_simple(adns_state ads, adns_query qu,
 			 struct timeval now) {
   vbuf vb_new;
   int id;
-  adns_status stat;
+  adns_status st;
 
-  if (typei->submithook) {
-    stat= adns__mkquery_labels(ads, &qu->vb, owner, ol, typei, flags);
-    if (stat) goto fail;
-
-    typei->submithook(qu, flags, now); 
-    if (qu->children.head) {
-      qu->state= query_childw;
-      LIST_LINK_TAIL(ads->childw,qu);
+  st= adns__mkquery(ads,&qu->vb,&id, owner,ol,
+		      typei,qu->answer->type, flags);
+  if (st) {
+    if (st == adns_s_querydomaintoolong && (flags & adns_qf_search)) {
+      adns__search_next(ads,qu,now);
+      return;
+    } else {
+      adns__query_fail(qu,st);
+      return;
     }
-    return;
   }
-  else {
-    stat= adns__mkquery(ads,&qu->vb,&id, owner,ol,
-			typei,qu->answer->type,flags);
-    if (stat) goto fail;
+
+  st= check_domain_name(ads, flags,&qu->ctx,typei, qu->vb.buf,qu->vb.used);
+  if (st) { adns__query_fail(qu,st); return; }
 
   vb_new= qu->vb;
   adns__vbuf_init(&qu->vb);
   query_submit(ads,qu, typei,&vb_new,id, flags,now);
-    return;
-  }
- fail:
-  if (stat == adns_s_querydomaintoolong && (flags & adns_qf_search)) 
-    adns__search_next(ads,qu,now);
-  else
-    adns__query_fail(qu,stat);
 }
 
 void adns__search_next(adns_state ads, adns_query qu, struct timeval now) {
   const char *nextentry;
-  adns_status stat;
+  adns_status st;
   
   if (qu->search_doneabs<0) {
     nextentry= 0;
@@ -206,7 +214,7 @@ void adns__search_next(adns_state ads, adns_query qu, struct timeval now) {
     if (qu->search_pos >= ads->nsearchlist) {
       if (qu->search_doneabs) {
 	qu->search_vb.used= qu->search_origlen;
-	stat= adns_s_nxdomain; goto x_fail;
+	st= adns_s_nxdomain; goto x_fail;
       } else {
 	nextentry= 0;
 	qu->search_doneabs= 1;
@@ -231,9 +239,9 @@ void adns__search_next(adns_state ads, adns_query qu, struct timeval now) {
   return;
 
 x_nomemory:
-  stat= adns_s_nomemory;
+  st= adns_s_nomemory;
 x_fail:
-  adns__query_fail(qu,stat);
+  adns__query_fail(qu,st);
 }
 
 static int save_owner(adns_query qu, const char *owner, int ol) {
@@ -259,7 +267,7 @@ int adns_submit(adns_state ads,
 		void *context,
 		adns_query *query_r) {
   int r, ol, ndots;
-  adns_status stat;
+  adns_status st;
   const typeinfo *typei;
   struct timeval now;
   adns_query qu;
@@ -267,8 +275,11 @@ int adns_submit(adns_state ads,
 
   adns__consistency(ads,0,cc_entex);
 
-  if (!(flags & adns__qf_ip_mask))
-    flags |= default_ip6_flags(ads);
+  if (flags & ~(adns_queryflags)0x4009ffff)
+    /* 0x40080000 are reserved for `harmless' future expansion
+     * 0x00000020 used to be adns_qf_quoteok_cname, now the default;
+     * see also addrfam.c:textaddr_check_qf */
+    return ENOSYS;
 
   typei= adns__findtype(type);
   if (!typei) return ENOSYS;
@@ -278,13 +289,14 @@ int adns_submit(adns_state ads,
   
   qu->ctx.ext= context;
   qu->ctx.callback= 0;
-  memset(&qu->ctx.info,0,sizeof(qu->ctx.info));
+  memset(&qu->ctx.pinfo,0,sizeof(qu->ctx.pinfo));
+  memset(&qu->ctx.tinfo,0,sizeof(qu->ctx.tinfo));
 
   *query_r= qu;
 
   ol= strlen(owner);
-  if (!ol) { stat= adns_s_querydomaininvalid; goto x_adnsfail; }
-  if (ol>DNS_MAXDOMAIN+1) { stat= adns_s_querydomaintoolong; goto x_adnsfail; }
+  if (!ol) { st= adns_s_querydomaininvalid; goto x_adnsfail; }
+  if (ol>DNS_MAXDOMAIN+1) { st= adns_s_querydomaintoolong; goto x_adnsfail; }
 				 
   if (ol>=1 && owner[ol-1]=='.' && (ol<2 || owner[ol-2]!='\\')) {
     flags &= ~adns_qf_search;
@@ -294,7 +306,7 @@ int adns_submit(adns_state ads,
 
   if (flags & adns_qf_search) {
     r= adns__vbuf_append(&qu->search_vb,owner,ol);
-    if (!r) { stat= adns_s_nomemory; goto x_adnsfail; }
+    if (!r) { st= adns_s_nomemory; goto x_adnsfail; }
 
     for (ndots=0, p=owner; (p= strchr(p,'.')); p++, ndots++);
     qu->search_doneabs= (ndots >= ads->searchndots) ? -1 : 0;
@@ -302,23 +314,23 @@ int adns_submit(adns_state ads,
     adns__search_next(ads,qu,now);
   } else {
     if (flags & adns_qf_owner) {
-      if (!save_owner(qu,owner,ol)) { stat= adns_s_nomemory; goto x_adnsfail; }
+      if (!save_owner(qu,owner,ol)) { st= adns_s_nomemory; goto x_adnsfail; }
     }
     query_simple(ads,qu, owner,ol, typei,flags, now);
   }
   adns__autosys(ads,now);
-  adns__consistency(ads,qu,cc_entex);
+  adns__returning(ads,qu);
   return 0;
 
  x_adnsfail:
-  adns__query_fail(qu,stat);
-  adns__consistency(ads,qu,cc_entex);
+  adns__query_fail(qu,st);
+  adns__returning(ads,qu);
   return 0;
 
  x_errno:
   r= errno;
   assert(r);
-  adns__consistency(ads,0,cc_entex);
+  adns__returning(ads,0);
   return r;
 }
 
@@ -329,53 +341,15 @@ int adns_submit_reverse_any(adns_state ads,
 			    adns_queryflags flags,
 			    void *context,
 			    adns_query *query_r) {
-  const unsigned char *iaddr;
-  char *buf, *buf_free;
+  char *buf, *buf_free = 0;
   char shortbuf[100];
-  int r, lreq;
+  int r;
 
   flags &= ~adns_qf_search;
 
-  switch (addr->sa_family) {
-  default: return ENOSYS;
-  case AF_INET: 
-    iaddr= (const unsigned char*) &((const struct sockaddr_in*)addr)->sin_addr;      
-  lreq= strlen(zone) + 4*4 + 1;
-  if (lreq > sizeof(shortbuf)) {
-      buf= malloc(lreq);
-    if (!buf) return errno;
-    buf_free= buf;
-  } else {
-    buf= shortbuf;
-    buf_free= 0;
-  }
-  sprintf(buf, "%d.%d.%d.%d.%s", iaddr[3], iaddr[2], iaddr[1], iaddr[0], zone);
-    break;
-  case AF_INET6:
-    iaddr= (const unsigned char*) &((const struct sockaddr_in6*)addr)->sin6_addr;      
-    lreq = strlen(zone) + 2*32 + 1;
-    if (lreq > sizeof(shortbuf)) {
-      buf= malloc(lreq);
-      if (!buf) return errno;
-      buf_free= buf;
-    }
-    else {
-      buf= shortbuf;
-      buf_free= 0;
-    }
-    strcpy(buf + 2*32, zone);
-    {
-      int i;
-      const unsigned char *p;
-      static const unsigned char hex[16] = "0123456789abcdef";
-      for (i = 0, p = iaddr + 15; i < 2*32; p--) {
-	buf[i++] = hex[*p & 0xf];
-	buf[i++] = '.';
-	buf[i++] = hex[*p / 0x10];
-	buf[i++] = '.';
-      }
-    }
-  }
+  buf = shortbuf;
+  r= adns__make_reverse_domain(addr,zone, &buf,sizeof(shortbuf),&buf_free);
+  if (r) return r;
   r= adns_submit(ads,buf,type,flags,context,query_r);
   free(buf_free);
   return r;
@@ -387,34 +361,10 @@ int adns_submit_reverse(adns_state ads,
 			adns_queryflags flags,
 			void *context,
 			adns_query *query_r) {
-  int r;
-  /* Address record used for forward lookup and consistency check */
-  adns_rr_addr rr;
-  const char *zone;
-  
-  if (type != adns_r_ptr && type != adns_r_ptr_raw) return EINVAL;
-  memset(&rr, 0, sizeof(rr));
-  rr.addr.sa.sa_family = addr->sa_family;
-  
-  switch (addr->sa_family) {
-  default: return ENOSYS;
-  case AF_INET:
-    zone = "in-addr.arpa";
-    rr.len = sizeof(rr.addr.inet);
-    rr.addr.inet.sin_addr = ((const struct sockaddr_in *)addr)->sin_addr;
-    break;
-  case AF_INET6:
-    zone = "ip6.arpa";
-    rr.len = sizeof(rr.addr.inet6);
-    rr.addr.inet6.sin6_addr = ((const struct sockaddr_in6 *)addr)->sin6_addr;
-    break;
-  }
-  
-  r= adns_submit_reverse_any(ads,addr,zone,
-				 type,flags,context,query_r);
-  if (r) return r;
-  (*query_r)->extra.info.ptr_addr = rr;
-  return 0;
+  if (((type^adns_r_ptr) & adns_rrt_reprmask) &&
+      ((type^adns_r_ptr_raw) & adns_rrt_reprmask))
+    return EINVAL;
+  return adns_submit_reverse_any(ads,addr,0,type,flags,context,query_r);
 }
 
 int adns_synchronous(adns_state ads,
@@ -442,34 +392,8 @@ static void *alloc_common(adns_query qu, size_t sz) {
   an= malloc(MEM_ROUND(MEM_ROUND(sizeof(*an)) + sz));
   if (!an) return 0;
   LIST_LINK_TAIL(qu->allocations,an);
-  an->size = sz;
+  an->sz= sz;
   return (byte*)an + MEM_ROUND(sizeof(*an));
-}
-
-void *adns__realloc_interim(adns_query qu, void *p, size_t sz) {
-  allocnode *an; 
-  allocnode *nan;
-
-  sz = MEM_ROUND(sz);
-  assert(sz); /* Freeing via realloc not supported */
-  assert(!qu->final_allocspace);
-
-  an = (allocnode *) ((byte *) p - MEM_ROUND(sizeof(*an)));
-  assert(an->size <= qu->interim_allocd);
-
-  nan = realloc(an, MEM_ROUND(MEM_ROUND(sizeof(*an)) + sz));
-  if (!nan) return 0;
-
-  qu->interim_allocd -= nan->size;
-  qu->interim_allocd += sz;
-  nan->size = sz;
-  
-  if (nan->next) nan->next->back = nan;
-  else qu->allocations.tail = nan;
-  if (nan->back) nan->back->next = nan;
-  else qu->allocations.head = nan;
-  
-  return (byte*)nan + MEM_ROUND(sizeof(*nan));
 }
 
 void *adns__alloc_interim(adns_query qu, size_t sz) {
@@ -492,16 +416,36 @@ void *adns__alloc_preserved(adns_query qu, size_t sz) {
   return rv;
 }
 
+static allocnode *alloc__info(adns_query qu, void *p, size_t *sz_r) {
+  allocnode *an;
+
+  if (!p || p == qu) { *sz_r= 0; return 0; }
+  an= (allocnode *)((byte *)p - MEM_ROUND(sizeof(allocnode)));
+  *sz_r= MEM_ROUND(an->sz);
+  return an;
+}
+
+void adns__free_interim(adns_query qu, void *p) {
+  size_t sz;
+  allocnode *an= alloc__info(qu, p, &sz);
+
+  if (!an) return;
+  assert(!qu->final_allocspace);
+  LIST_UNLINK(qu->allocations, an);
+  free(an);
+  qu->interim_allocd -= sz;
+  assert(!qu->interim_allocd >= 0);
+}
+
 void *adns__alloc_mine(adns_query qu, size_t sz) {
   return alloc_common(qu,MEM_ROUND(sz));
 }
 
-void adns__transfer_interim(adns_query from, adns_query to,
-			    void *block, size_t sz) {
-  allocnode *an;
+void adns__transfer_interim(adns_query from, adns_query to, void *block) {
+  size_t sz;
+  allocnode *an= alloc__info(from, block, &sz);
 
-  if (!block) return;
-  an= (void*)((byte*)block - MEM_ROUND(sizeof(*an)));
+  if (!an) return;
 
   assert(!to->final_allocspace);
   assert(!from->final_allocspace);
@@ -509,7 +453,6 @@ void adns__transfer_interim(adns_query from, adns_query to,
   LIST_UNLINK(from->allocations,an);
   LIST_LINK_TAIL(to->allocations,an);
 
-  sz= MEM_ROUND(sz);
   from->interim_allocd -= sz;
   to->interim_allocd += sz;
 
@@ -532,18 +475,18 @@ void *adns__alloc_final(adns_query qu, size_t sz) {
   return rp;
 }
 
-static void cancel_children(adns_query qu) {
+void adns__cancel_children(adns_query qu) {
   adns_query cqu, ncqu;
 
   for (cqu= qu->children.head; cqu; cqu= ncqu) {
     ncqu= cqu->siblings.next;
-    adns_cancel(cqu);
+    adns__cancel(cqu);
   }
 }
 
 void adns__reset_preserved(adns_query qu) {
   assert(!qu->final_allocspace);
-  cancel_children(qu);
+  adns__cancel_children(qu);
   qu->answer->nrrs= 0;
   qu->answer->rrs.untyped= 0;
   qu->interim_allocd= qu->preserved_allocd;
@@ -552,7 +495,7 @@ void adns__reset_preserved(adns_query qu) {
 static void free_query_allocs(adns_query qu) {
   allocnode *an, *ann;
 
-  cancel_children(qu);
+  adns__cancel_children(qu);
   for (an= qu->allocations.head; an; an= ann) { ann= an->next; free(an); }
   LIST_INIT(qu->allocations);
   adns__vbuf_free(&qu->vb);
@@ -561,11 +504,26 @@ static void free_query_allocs(adns_query qu) {
   qu->query_dgram= 0;
 }
 
-void adns_cancel(adns_query qu) {
+void adns__returning(adns_state ads, adns_query qu_for_caller) {
+  while (ads->intdone.head) {
+    adns_query iq= ads->intdone.head;
+    adns_query parent= iq->parent;
+    LIST_UNLINK_PART(parent->children,iq,siblings.);
+    LIST_UNLINK(iq->ads->childw,parent);
+    LIST_UNLINK(ads->intdone,iq);
+    iq->ctx.callback(parent,iq);
+    free_query_allocs(iq);
+    free(iq->answer);
+    free(iq);
+  }
+  adns__consistency(ads,qu_for_caller,cc_entex);
+}
+
+void adns__cancel(adns_query qu) {
   adns_state ads;
 
   ads= qu->ads;
-  adns__consistency(ads,qu,cc_entex);
+  adns__consistency(ads,qu,cc_freq);
   if (qu->parent) LIST_UNLINK_PART(qu->parent->children,qu,siblings.);
   switch (qu->state) {
   case query_tosend:
@@ -578,7 +536,10 @@ void adns_cancel(adns_query qu) {
     LIST_UNLINK(ads->childw,qu);
     break;
   case query_done:
-    LIST_UNLINK(ads->output,qu);
+    if (qu->parent)
+      LIST_UNLINK(ads->intdone,qu);
+    else
+      LIST_UNLINK(ads->output,qu);
     break;
   default:
     abort();
@@ -586,7 +547,16 @@ void adns_cancel(adns_query qu) {
   free_query_allocs(qu);
   free(qu->answer);
   free(qu);
-  adns__consistency(ads,0,cc_entex);
+}
+
+void adns_cancel(adns_query qu) {
+  adns_state ads;
+
+  assert(!qu->parent);
+  ads= qu->ads;
+  adns__consistency(ads,qu,cc_entex);
+  adns__cancel(qu);
+  adns__returning(ads,0);
 }
 
 void adns__update_expires(adns_query qu, unsigned long ttl,
@@ -637,10 +607,10 @@ static void makefinal_query(adns_query qu) {
 }
 
 void adns__query_done(adns_query qu) {
+  adns_state ads=qu->ads;
   adns_answer *ans;
-  adns_query parent;
 
-  cancel_children(qu);
+  adns__cancel_children(qu);
 
   qu->id= -1;
   ans= qu->answer;
@@ -653,7 +623,7 @@ void adns__query_done(adns_query qu) {
   }
 
   if (ans->nrrs && qu->typei->diff_needswap) {
-    if (!adns__vbuf_ensure(&qu->vb,qu->typei->rrsz)) {
+    if (!adns__vbuf_ensure(&qu->vb,qu->answer->rrsz)) {
       adns__query_fail(qu,adns_s_nomemory);
       return;
     }
@@ -664,28 +634,23 @@ void adns__query_done(adns_query qu) {
 		qu->ads);
   }
   if (ans->nrrs && qu->typei->postsort) {
-    qu->typei->postsort(qu->ads, ans->rrs.bytes, ans->nrrs, qu->typei);
+    qu->typei->postsort(qu->ads, ans->rrs.bytes,
+			ans->nrrs,ans->rrsz, qu->typei);
   }
 
   ans->expires= qu->expires;
-  parent= qu->parent;
-  if (parent) {
-    LIST_UNLINK_PART(parent->children,qu,siblings.);
-    LIST_UNLINK(qu->ads->childw,parent);
-    qu->ctx.callback(parent,qu);
-    free_query_allocs(qu);
-    free(qu->answer);
-    free(qu);
+  qu->state= query_done;
+  if (qu->parent) {
+    LIST_LINK_TAIL(ads->intdone,qu);
   } else {
     makefinal_query(qu);
     LIST_LINK_TAIL(qu->ads->output,qu);
-    qu->state= query_done;
   }
 }
 
-void adns__query_fail(adns_query qu, adns_status stat) {
+void adns__query_fail(adns_query qu, adns_status st) {
   adns__reset_preserved(qu);
-  qu->answer->status= stat;
+  qu->answer->status= st;
   adns__query_done(qu);
 }
 

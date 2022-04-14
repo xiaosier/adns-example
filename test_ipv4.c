@@ -3,9 +3,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <string.h>
 
-int test_dns(char *host)
-{
+int test_dns(char *host) {
     adns_state ads;
     adns_initflags flags;
     flags = adns_if_nosigpipe | adns_if_noerrprint;
@@ -17,13 +17,13 @@ int test_dns(char *host)
     int try_cnt = -1;
     int adns_cname = 0;
 
-    while(try_cnt < 32){
+    while (try_cnt < 32) {
         try_cnt += 1;
 
         adns_answer *ans;
         int res = adns_check(ads, &que, &ans, NULL);
-        if(res == 0){
-            if(ans->status == adns_s_prohibitedcname && ans->cname != NULL){
+        if (res == 0) {
+            if (ans->status == adns_s_prohibitedcname && ans->cname != NULL) {
                 //printf("ans->cname: %s\n", ans->cname);
                 char cname[128];
                 strncpy(cname, ans->cname, 127);
@@ -31,29 +31,28 @@ int test_dns(char *host)
                 adns_query que = NULL;
                 adns_submit(ads, cname, (adns_rrtype) adns_r_addr, (adns_queryflags) 0, NULL, &que);
                 adns_cname = 1;
-            }else{
-                if(adns_cname)
+            } else {
+                if (adns_cname)
                     printf("ip: %s\n", ans->status == adns_s_ok ? inet_ntoa(ans->rrs.addr->addr.inet.sin_addr) : "no");
                 else
                     printf("ip: %s\n", ans->status == adns_s_ok ? inet_ntoa(*(ans->rrs.inaddr)) : "no");
                 adns_finish(ads);
                 break;
             }
-        }
-        else if(res == ESRCH || res == EAGAIN) {
+        } else if (res == ESRCH || res == EAGAIN) {
             sleep(1);
-        }else{
-            printf("host(%s) is err!\n",host);
+        } else {
+            printf("host(%s) is err!\n", host);
         }
     }
     return 0;
 }
 
-int main(int argc, char *argv[]){
+int main(int argc, char *argv[]) {
     char host[128];
-    while(1){
-        scanf("%s",host);
-        if(strlen(host) == 3 && strcmp(host, "eof")) break;
+    while (1) {
+        scanf("%s", host);
+        if (strlen(host) == 3 && strcmp(host, "eof")) break;
         test_dns(host);
     }
     return 0;

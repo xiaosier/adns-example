@@ -4,15 +4,15 @@
  */
 /*
  *  This file is part of adns, which is
- *    Copyright (C) 2009 Luca Bruno
- *    Copyright (C) 1997-2000,2003,2006  Ian Jackson
+ *    Copyright (C) 1997-2000,2003,2006,2014  Ian Jackson
+ *    Copyright (C) 2014  Mark Wooding
  *    Copyright (C) 1999-2000,2003,2006  Tony Finch
  *    Copyright (C) 1991 Massachusetts Institute of Technology
  *  (See the file INSTALL for full details.)
  *  
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
+ *  the Free Software Foundation; either version 3, or (at your option)
  *  any later version.
  *  
  *  This program is distributed in the hope that it will be useful,
@@ -21,11 +21,8 @@
  *  GNU General Public License for more details.
  *  
  *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software Foundation,
- *  Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA. 
+ *  along with this program; if not, write to the Free Software Foundation.
  */
-
-#include <stdlib.h>
 
 #include "internal.h"
 
@@ -78,13 +75,18 @@ static void checkc_notcpbuf(adns_state ads) {
 }
 
 static void checkc_global(adns_state ads) {
+  const struct sortlist *sl;
   int i;
   
-  assert((ads->udpsocket >= 0) || (ads->udpsocket6 >= 0));
-#if 0
-  for (i=0; i<ads->nsortlist; i++)
-    assert(!(ads->sortlist[i].base.s_addr & ~ads->sortlist[i].mask.s_addr));
-#endif
+  assert(ads->udpsockets >= 0);
+
+  for (i=0; i<ads->nsortlist; i++) {
+    sl= &ads->sortlist[i];
+    assert(adns__addr_matches(sl->base.sa.sa_family,
+			      adns__sockaddr_addr(&sl->base.sa),
+			      &sl->base,&sl->mask));
+  }
+
   assert(ads->tcpserver >= 0 && ads->tcpserver < ads->nservers);
   
   switch (ads->tcpstate) {
@@ -148,15 +150,29 @@ static void checkc_queue_childw(adns_state ads) {
   });
 }
 
+static void checkc_query_done(adns_state ads, adns_query qu) {
+  assert(qu->state == query_done);
+  assert(!qu->children.head && !qu->children.tail);
+  checkc_query(ads,qu);
+}
+
 static void checkc_queue_output(adns_state ads) {
   adns_query qu;
   
   DLIST_CHECK(ads->output, qu, , {
-    assert(qu->state == query_done);
-    assert(!qu->children.head && !qu->children.tail);
     assert(!qu->parent);
     assert(!qu->allocations.head && !qu->allocations.tail);
-    checkc_query(ads,qu);
+    checkc_query_done(ads,qu);
+  });
+}
+
+static void checkc_queue_intdone(adns_state ads) {
+  adns_query qu;
+  
+  DLIST_CHECK(ads->intdone, qu, , {
+    assert(qu->parent);
+    assert(qu->ctx.callback);
+    checkc_query_done(ads,qu);
   });
 }
 
@@ -168,6 +184,7 @@ void adns__consistency(adns_state ads, adns_query qu, consistency_checks cc) {
     break;
   case cc_entex:
     if (!(ads->iflags & adns_if_checkc_entex)) return;
+    assert(!ads->intdone.head);
     break;
   case cc_freq:
     if ((ads->iflags & adns_if_checkc_freq) != adns_if_checkc_freq) return;
@@ -181,6 +198,7 @@ void adns__consistency(adns_state ads, adns_query qu, consistency_checks cc) {
   checkc_queue_tcpw(ads);
   checkc_queue_childw(ads);
   checkc_queue_output(ads);
+  checkc_queue_intdone(ads);
 
   if (qu) {
     switch (qu->state) {
@@ -194,7 +212,10 @@ void adns__consistency(adns_state ads, adns_query qu, consistency_checks cc) {
       DLIST_ASSERTON(qu, search, ads->childw, );
       break;
     case query_done:
-      DLIST_ASSERTON(qu, search, ads->output, );
+      if (qu->parent)
+	DLIST_ASSERTON(qu, search, ads->intdone, );
+      else
+	DLIST_ASSERTON(qu, search, ads->output, );
       break;
     default:
       assert(!"specific query state");

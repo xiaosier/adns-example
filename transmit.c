@@ -5,15 +5,15 @@
  */
 /*
  *  This file is part of adns, which is
- *    Copyright (C) 2009 Luca Bruno
- *    Copyright (C) 1997-2000,2003,2006  Ian Jackson
+ *    Copyright (C) 1997-2000,2003,2006,2014  Ian Jackson
+ *    Copyright (C) 2014  Mark Wooding
  *    Copyright (C) 1999-2000,2003,2006  Tony Finch
  *    Copyright (C) 1991 Massachusetts Institute of Technology
  *  (See the file INSTALL for full details.)
  *  
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
+ *  the Free Software Foundation; either version 3, or (at your option)
  *  any later version.
  *  
  *  This program is distributed in the hope that it will be useful,
@@ -22,8 +22,7 @@
  *  GNU General Public License for more details.
  *  
  *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software Foundation,
- *  Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA. 
+ *  along with this program; if not, write to the Free Software Foundation.
  */
 
 #include <errno.h>
@@ -63,8 +62,6 @@ static adns_status mkquery_header(adns_state ads, vbuf *vb,
   return adns_s_ok;
 }
 
-/* FIXME: Return value is always adns_s_ok, and never used. But I
- * don't understand why we can assert that we have space in the vbuf. */
 static adns_status mkquery_footer(vbuf *vb, adns_rrtype type) {
   byte *rqp;
 
@@ -77,11 +74,10 @@ static adns_status mkquery_footer(vbuf *vb, adns_rrtype type) {
   return adns_s_ok;
 }
 
-adns_status adns__qdpl_normal(adns_state ads,
-			      const char **p_io, const char *pe, int labelnum,
-			      char label_r[], int *ll_io,
-			      adns_queryflags flags,
-			      const typeinfo *typei) {
+static adns_status qdparselabel(adns_state ads,
+				const char **p_io, const char *pe,
+				char label_r[], int *ll_io,
+				adns_queryflags flags) {
   int ll, c;
   const char *p;
 
@@ -105,13 +101,6 @@ adns_status adns__qdpl_normal(adns_state ads,
 	return adns_s_querydomaininvalid;
       }
     }
-    if (!(flags & adns_qf_quoteok_query)) {
-      if (c == '-') {
-	if (!ll) return adns_s_querydomaininvalid;
-      } else if (!ctype_alpha(c) && !ctype_digit(c)) {
-	return adns_s_querydomaininvalid;
-      }
-    }
     if (ll == *ll_io) return adns_s_querydomaininvalid;
     label_r[ll++]= c;
   }
@@ -121,24 +110,25 @@ adns_status adns__qdpl_normal(adns_state ads,
   return adns_s_ok;
 }
 
-adns_status adns__mkquery_labels(adns_state ads, vbuf *vb,
+adns_status adns__mkquery(adns_state ads, vbuf *vb, int *id_r,
 			  const char *owner, int ol,
-				 const typeinfo *typei, adns_queryflags flags) {
-  int labelnum, ll, nbytes;
-  byte label[255], *rqp;
+			  const typeinfo *typei, adns_rrtype type,
+			  adns_queryflags flags) {
+  int ll, nbytes;
+  byte label[255];
+  byte *rqp;
   const char *p, *pe;
   adns_status st;
 
-  if (!adns__vbuf_ensure(vb,ol+2)) return adns_s_nomemory;
+  st= mkquery_header(ads,vb,id_r,ol+2); if (st) return st;
   
   MKQUERY_START(vb);
 
   p= owner; pe= owner+ol;
   nbytes= 0;
-  labelnum= 0;
   while (p!=pe) {
     ll= sizeof(label);
-    st= typei->qdparselabel(ads, &p,pe, labelnum++, label, &ll, flags, typei);
+    st= qdparselabel(ads, &p,pe, label, &ll, flags);
     if (st) return st;
     if (!ll) return adns_s_querydomaininvalid;
     if (ll > DNS_MAXLABEL) return adns_s_querydomaintoolong;
@@ -150,31 +140,22 @@ adns_status adns__mkquery_labels(adns_state ads, vbuf *vb,
   MKQUERY_ADDB(0);
 
   MKQUERY_STOP(vb);
-  return adns_s_ok;  
-}
-
-adns_status adns__mkquery(adns_state ads, vbuf *vb, int *id_r,
-			  const char *owner, int ol,
-			  const typeinfo *typei, adns_rrtype type,
-			  adns_queryflags flags) {
-  adns_status st;
   
-  st= mkquery_header(ads,vb,id_r,ol+2); if (st) return st;
-  st= adns__mkquery_labels(ads, vb, owner, ol, typei, flags); if (st) return st;
   st= mkquery_footer(vb,type);
   
   return adns_s_ok;
 }
 
-adns_status adns__mkquery_labels_frdgram(adns_state ads, vbuf *vb,
+adns_status adns__mkquery_frdgram(adns_state ads, vbuf *vb, int *id_r,
 				  const byte *qd_dgram, int qd_dglen,
-                                         int qd_begin) {
-  adns_status st;
+				  int qd_begin,
+				  adns_rrtype type, adns_queryflags flags) {
   byte *rqp;
   findlabel_state fls;
   int lablen, labstart;
+  adns_status st;
 
-  if (!adns__vbuf_ensure(vb,qd_dglen)) return adns_s_nomemory;
+  st= mkquery_header(ads,vb,id_r,qd_dglen); if (st) return st;
 
   MKQUERY_START(vb);
 
@@ -191,30 +172,6 @@ adns_status adns__mkquery_labels_frdgram(adns_state ads, vbuf *vb,
 
   MKQUERY_STOP(vb);
   
-  return adns_s_ok;  
-}
-
-adns_status adns__mkquery_frdgram(adns_state ads, vbuf *vb, int *id_r,
-				  const byte *qd_dgram, int qd_dglen,
-				  int qd_begin,
-				  adns_rrtype type, adns_queryflags flags) {
-  adns_status st;
-
-  st= mkquery_header(ads,vb,id_r,qd_dglen); if (st) return st;
-  st= adns__mkquery_labels_frdgram(ads, vb, qd_dgram, qd_dglen, qd_begin);
-  if (st) return st;
-  st= mkquery_footer(vb,type);
-  
-  return adns_s_ok;
-}
-
-adns_status adns__mkquery_frlabels(adns_state ads, vbuf *vb, int *id_r,
-                                   char *l, int llen,
-                                   adns_rrtype type, adns_queryflags flags) {
-  adns_status st;
-  
-  st= mkquery_header(ads,vb,id_r,llen); if (st) return st;
-  if (!adns__vbuf_append(vb, l, llen)) return adns_s_nomemory;
   st= mkquery_footer(vb,type);
   
   return adns_s_ok;
@@ -283,11 +240,18 @@ static void query_usetcp(adns_query qu, struct timeval now) {
   adns__tcp_tryconnect(qu->ads,now);
 }
 
+struct udpsocket *adns__udpsocket_by_af(adns_state ads, int af) {
+  int i;
+  for (i=0; i<ads->nudpsockets; i++)
+    if (ads->udpsockets[i].af == af) return &ads->udpsockets[i];
+  return 0;
+}
+
 void adns__query_send(adns_query qu, struct timeval now) {
-  struct sockaddr_in servaddr;
-  struct sockaddr_in6 servaddr6;
   int serv, r;
   adns_state ads;
+  struct udpsocket *udp;
+  adns_rr_addr *addr;
 
   assert(qu->state == query_tosend);
   if ((qu->flags & adns_qf_usevc) || (qu->query_dglen > DNS_MAXUDP)) {
@@ -300,26 +264,14 @@ void adns__query_send(adns_query qu, struct timeval now) {
     return;
   }
 
-  serv= qu->udpnextserver;
   ads= qu->ads;
-
-  if(ads->servers[serv].sin_family == AF_INET) {
-    memset(&servaddr,0,sizeof(servaddr));
-    servaddr.sin_family= ads->servers[serv].sin_family;
-    servaddr.sin_addr= ads->servers[serv].addr;
-    servaddr.sin_port= htons(DNS_PORT);
-    r= sendto(ads->udpsocket,qu->query_dgram,qu->query_dglen,0,
-		(const struct sockaddr*)&servaddr,sizeof(servaddr));
-  } else {
-    memset(&servaddr6,0,sizeof(servaddr6));
-    servaddr6.sin6_family= ads->servers[serv].sin_family;
-    servaddr6.sin6_addr= ads->servers[serv].addr6;
-    servaddr6.sin6_port= htons(DNS_PORT);
-    r= sendto(ads->udpsocket6,qu->query_dgram,qu->query_dglen,0,
-		(const struct sockaddr*)&servaddr6,sizeof(servaddr6));
-  }
-
+  serv= qu->udpnextserver;
+  addr= &ads->servers[serv];
+  udp= adns__udpsocket_by_af(ads, addr->addr.sa.sa_family);
+  assert(udp);
   
+  r= sendto(udp->fd,qu->query_dgram,qu->query_dglen,0,
+	    &addr->addr.sa,addr->len);
   if (r<0 && errno == EMSGSIZE) {
     qu->retries= 0;
     query_usetcp(qu,now);

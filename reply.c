@@ -4,14 +4,15 @@
  */
 /*
  *  This file is part of adns, which is
- *    Copyright (C) 1997-2000,2003,2006  Ian Jackson
+ *    Copyright (C) 1997-2000,2003,2006,2014  Ian Jackson
+ *    Copyright (C) 2014  Mark Wooding
  *    Copyright (C) 1999-2000,2003,2006  Tony Finch
  *    Copyright (C) 1991 Massachusetts Institute of Technology
  *  (See the file INSTALL for full details.)
  *  
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2, or (at your option)
+ *  the Free Software Foundation; either version 3, or (at your option)
  *  any later version.
  *  
  *  This program is distributed in the hope that it will be useful,
@@ -20,8 +21,7 @@
  *  GNU General Public License for more details.
  *  
  *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software Foundation,
- *  Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA. 
+ *  along with this program; if not, write to the Free Software Foundation.
  */
 
 #include <stdlib.h>
@@ -34,7 +34,7 @@ void adns__procdgram(adns_state ads, const byte *dgram, int dglen,
   int id, f1, f2, qdcount, ancount, nscount, arcount;
   int flg_ra, flg_rd, flg_tc, flg_qr, opcode;
   int rrtype, rrclass, rdlength, rdstart;
-  int anstart, nsstart, arstart;
+  int anstart, nsstart;
   int ownermatched, l, nrrs;
   unsigned long ttl, soattl;
   const typeinfo *typei;
@@ -157,7 +157,6 @@ void adns__procdgram(adns_state ads, const byte *dgram, int dglen,
    * query now. */
   
   anstart= qu->query_dglen;
-  arstart= -1;
 
   /* Now, take a look at the answer section, and see if it is complete.
    * If it has any CNAMEs we stuff them in the answer.
@@ -312,7 +311,7 @@ void adns__procdgram(adns_state ads, const byte *dgram, int dglen,
 
   /* Now, we have some RRs which we wanted. */
 
-  qu->answer->rrs.untyped= adns__alloc_interim(qu,qu->typei->rrsz*wantedrrs);
+  qu->answer->rrs.untyped= adns__alloc_interim(qu,qu->answer->rrsz*wantedrrs);
   if (!qu->answer->rrs.untyped) {
     adns__query_fail(qu,adns_s_nomemory);
     return;
@@ -342,7 +341,8 @@ void adns__procdgram(adns_state ads, const byte *dgram, int dglen,
 	!ownermatched)
       continue;
     adns__update_expires(qu,ttl,now);
-    st= typei->parse(&pai, rdstart,rdstart+rdlength, rrsdata+nrrs*typei->rrsz);
+    st= typei->parse(&pai, rdstart,rdstart+rdlength,
+		     rrsdata+nrrs*qu->answer->rrsz);
     if (st) { adns__query_fail(qu,st); return; }
     if (rdstart==-1) goto x_truncated;
     nrrs++;

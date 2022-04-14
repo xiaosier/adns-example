@@ -5,7 +5,7 @@ CFLAGS = -g
 TARGETS=libadns.a
 
 LIBOBJS=types.o event.o query.o reply.o general.o setup.o transmit.o \
-		parse.o poll.o check.o
+		parse.o poll.o check.o addrfam.o
 
 all: test_ipv4
 

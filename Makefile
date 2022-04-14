@@ -7,9 +7,9 @@ TARGETS=libadns.a
 LIBOBJS=types.o event.o query.o reply.o general.o setup.o transmit.o \
 		parse.o poll.o check.o addrfam.o
 
-all: test_ipv4
+all: test_txt
 
-test_ipv4: test_ipv4.c libadns.a
+test_txt: test_txt.c libadns.a
 
 libadns.a: $(LIBOBJS)
 		rm -f $@
